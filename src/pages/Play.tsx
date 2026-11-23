@@ -8,6 +8,8 @@ import { warpQuad, sampleOcclusion, inkCutout, findNewInk, cropDataURL, RECT_W, 
 import { audio } from "../lib/audio";
 import { bridge } from "../lib/bridge";
 import { actionForLabel } from "../lib/binding";
+import { CapTracker } from "../lib/capTracker";
+import { DriftMonitor } from "../lib/drift";
 
 type Phase = "choose" | "lock" | "live";
 interface LogRow { id: number; text: string; t: string }
@@ -34,6 +36,7 @@ export default function Play() {
   const [audioLat, setAudioLat] = useState(0);
   const [pasteText, setPasteText] = useState("");
   const [modelState, setModelState] = useState("loading hand tracker…");
+  const [driftWarn, setDriftWarn] = useState(false);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const stageRef = useRef<HTMLDivElement>(null);
@@ -54,12 +57,17 @@ export default function Play() {
   const lastInkCheck = useRef(0);
   const pendingInk = useRef<{ r: [number, number, number, number]; t: number } | null>(null);
   const inkBusy = useRef(false);
-  const dialState = useRef({ angle: 0, lastTipAngle: null as number | null, norm: 0.5 });
   const heldKeys = useRef(new Set<string>());
   const gamePos = useRef({ x: 0.5, y: 0.5 });
   const latSamples = useRef<number[]>([]);
   const logId = useRef(0);
   const lastVolSend = useRef(0);
+  const capTrackers = useRef(new Map<string, CapTracker>());
+  const driftMon = useRef(new DriftMonitor());
+  const frameCanvas = useRef<HTMLCanvasElement | null>(null);
+  const lastDriftCheck = useRef(0);
+  const driftBreaches = useRef(0);
+  const lastDialUi = useRef(0);
 
   phaseRef.current = phase;
   layoutRef.current = layout;
@@ -160,25 +168,8 @@ export default function Play() {
       }
       return;
     }
-    if (c.a === "aud.filter" && e.type === "move" && e.angle !== undefined) {
-      const st = dialState.current;
-      if (st.lastTipAngle !== null) {
-        let d = e.angle - st.lastTipAngle;
-        if (d > Math.PI) d -= Math.PI * 2;
-        if (d < -Math.PI) d += Math.PI * 2;
-        if (Math.abs(d) > 0.02) {
-          st.angle += d;
-          st.norm = Math.min(1, Math.max(0, st.norm + d / (Math.PI * 1.5)));
-          audio.setFilterNorm(st.norm);
-          setDialDeg(Math.round(((st.angle * 180) / Math.PI) % 360));
-        }
-      }
-      st.lastTipAngle = e.angle;
-      return;
-    }
-    if (e.type === "up" && c.k === "dial") {
-      dialState.current.lastTipAngle = null;
-    }
+    // aud.filter: the dial is owned by the real bottle-cap tracker
+    // (polish panel P1) — fingertip angle is never used for it.
   }
 
   // ------------------------------------------------------------ main loop
@@ -247,6 +238,51 @@ export default function Play() {
       }
       const frameT = now;
       engineRef.current.frame({ t: frameT, tip: tipPaper, occ, speed });
+
+      // bottle-cap tracker (polish P1): read-only, runs on the rectified view
+      const layNow = layoutRef.current;
+      if (layNow) {
+        for (const c of layNow.c) {
+          if (c.k !== "dial") continue;
+          const tracker = capTrackers.current.get(c.id);
+          if (!tracker) continue;
+          let fingerNear = false;
+          if (tipPaper) {
+            const cx = c.r[0] + c.r[2] / 2;
+            const cy = c.r[1] + c.r[3] / 2;
+            const R = Math.min(c.r[2], c.r[3]) / 2;
+            fingerNear = Math.hypot(tipPaper.u - cx, tipPaper.v - cy) < R * 0.75;
+          }
+          const reading = tracker.update(rect, c, fingerNear, now);
+          if (reading) {
+            audio.setFilterNorm(reading.norm);
+            if (now - lastDialUi.current > 90) {
+              lastDialUi.current = now;
+              setDialDeg(Math.round(reading.totalDeg % 360));
+            }
+          }
+        }
+      }
+
+      // sheet-drift monitor (polish P3): hand-free, every 2 s, read-only
+      if (now - lastDriftCheck.current > 2000 && now - lastHandSeen.current > 300) {
+        lastDriftCheck.current = now;
+        if (!frameCanvas.current) {
+          frameCanvas.current = document.createElement("canvas");
+        }
+        const fc = frameCanvas.current;
+        fc.width = video.videoWidth;
+        fc.height = video.videoHeight;
+        const fctx = fc.getContext("2d", { willReadFrequently: true })!;
+        fctx.drawImage(video, 0, 0);
+        const fimg = fctx.getImageData(0, 0, fc.width, fc.height);
+        if (driftMon.current.check(fimg, cornersPx)) {
+          driftBreaches.current++;
+          if (driftBreaches.current >= 3) setDriftWarn(true);
+        } else {
+          driftBreaches.current = 0;
+        }
+      }
 
       // twin fingertip dot + control state classes (direct DOM, no re-render)
       const dot = twinDotRef.current;
@@ -435,9 +471,31 @@ export default function Play() {
     const cuts: Record<string, string> = {};
     for (const c of lay.c) cuts[c.id] = inkCutout(rect, c);
     setCutouts(cuts);
+    // polish P1: arm a cap tracker per dial, reference ring from this frame
+    capTrackers.current.clear();
+    for (const c of lay.c) {
+      if (c.k === "dial") {
+        const tr = new CapTracker();
+        tr.captureReference(rect, c);
+        capTrackers.current.set(c.id, tr);
+      }
+    }
+    // polish P3: drift reference from the raw frame
+    if (!frameCanvas.current) frameCanvas.current = document.createElement("canvas");
+    const fc = frameCanvas.current;
+    fc.width = video.videoWidth;
+    fc.height = video.videoHeight;
+    const fctx = fc.getContext("2d", { willReadFrequently: true })!;
+    fctx.drawImage(video, 0, 0);
+    driftMon.current.setReference(fctx.getImageData(0, 0, fc.width, fc.height), cs);
+    driftBreaches.current = 0;
+    setDriftWarn(false);
     engineRef.current?.reset();
     setPhase("live");
     addLog("Sheet locked. Play the ink! 🎉");
+    if (lay.c.some((c) => c.k === "dial")) {
+      addLog("🎛 Cap tracker armed — draw ONE bold line on the bottle cap, centre to rim, then twist it.");
+    }
   }
 
   // WASD mini-game render loop
@@ -552,6 +610,24 @@ export default function Play() {
             </div>
           )}
           {phase === "lock" && <div className="overlay-msg">{cornerHint}</div>}
+          {driftWarn && phase === "live" && (
+            <div className="overlay-msg" style={{ top: "auto", bottom: 14, background: "var(--sun)" }}>
+              📐 The sheet seems to have shifted.{" "}
+              <button
+                className="btn"
+                style={{ padding: "0.25rem 0.7rem", fontSize: "0.85rem" }}
+                onClick={() => {
+                  setDriftWarn(false);
+                  driftBreaches.current = 0;
+                  setPhase("lock");
+                  setCorners([]);
+                  cornersRef.current = [];
+                }}
+              >
+                Re-lock corners
+              </button>
+            </div>
+          )}
           {corners.map((c, i) => {
             const video = videoRef.current;
             const stage = stageRef.current;
