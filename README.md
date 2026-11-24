@@ -8,7 +8,7 @@ Built for **GenHacks 2026**. Open source (MIT).
 
 ## Live demo
 
-- App: https://drawanything-eta.vercel.app *(check the Devpost page for the current deploy link)*
+- App: https://drawanything-xi.vercel.app
 - Try it with zero drawing: open **Play → “Use the demo desk”**, click the 4 corners of any sheet of paper in the camera view, and tap the matching spots on the paper.
 
 ## How it works
